@@ -168,7 +168,9 @@ public class HuskyLensV2 extends I2cDeviceSynchDevice<I2cDeviceSynch> {
     }
 
     private static int readU16(byte[] buf, int offset) {
-        if (offset + 1 >= buf.length) return 0;
+        if (buf == null || offset < 0 || offset + 1 >= buf.length) {
+            return 0;
+        }
         return (buf[offset] & 0xFF) | ((buf[offset + 1] & 0xFF) << 8);
     }
 
@@ -196,8 +198,8 @@ public class HuskyLensV2 extends I2cDeviceSynchDevice<I2cDeviceSynch> {
     private volatile byte[] latestRawResult = new byte[0];             // Shared memory data source / 共享的内存最新 Raw 数据源
     private volatile Thread pollingThread = null;                      // Background high-speed thread / 后台极速轮询工作线程
     private volatile Algorithm currentAlgo = Algorithm.ALGORITHM_ANY;  // Currently active algorithm / 当前激活工作的算法
-    private boolean nextPacketSwallowedHeader = false;                 // Flag for mathematically swallowed 0x55 / 标志位：下一包首字节 0x55 是否已被吞
-    private int currentAlgoId = 0;                                     // Dynamic algorithm ID for reconstitution / 动态记录当前算法 ID，用于校验和还原
+    private volatile boolean nextPacketSwallowedHeader = false;                 // Flag for mathematically swallowed 0x55 / 标志位：下一包首字节 0x55 是否已被吞
+    private volatile int currentAlgoId = 0;                                       // Dynamic algorithm ID for reconstitution / 动态记录当前算法 ID，用于校验和还原
     private volatile int targetPollingIntervalMs = 50;                 // Default duty-cycle period 50ms (20Hz) / 默认目标周期 50ms (20Hz)
     private volatile Algorithm pendingAlgorithm = null;                // Pending algorithm to be switched / 暂存待切换的算法请求
 
@@ -213,6 +215,12 @@ public class HuskyLensV2 extends I2cDeviceSynchDevice<I2cDeviceSynch> {
      * @param algo Initial algorithm / 初始化工作算法
      */
     public synchronized void startPolling(Algorithm algo) {
+        if (isPolling && pollingThread != null && pollingThread.isAlive()) {
+            if (this.currentAlgo != algo) {
+                switchAlgorithm(algo); // 💡 自动进行后台非阻塞切换
+            }
+            return;
+        }
         stopPolling(false); // Reset rapidly with 0ms delay / 快速重置，不进行阻塞式等待，开销为 0ms
         this.currentAlgo = algo;
         this.isPolling = true;
@@ -233,6 +241,7 @@ public class HuskyLensV2 extends I2cDeviceSynchDevice<I2cDeviceSynch> {
                         if (pendingAlgorithm != null) {
                             Algorithm target = pendingAlgorithm;
                             pendingAlgorithm = null;
+                            latestRawResult = new byte[0]; // ← 立即作废旧数据
                             switchAlgorithmSync(target);
 
                             Thread.sleep(1500);
@@ -405,6 +414,10 @@ public class HuskyLensV2 extends I2cDeviceSynchDevice<I2cDeviceSynch> {
         long deadline = System.currentTimeMillis() + timeoutMs;
 
         while (System.currentTimeMillis() < deadline) {
+            if (Thread.currentThread().isInterrupted() || !isPolling) {
+                return null;
+            }
+
             byte[] header = new byte[5];
             byte id = 0;
 
@@ -570,6 +583,9 @@ public class HuskyLensV2 extends I2cDeviceSynchDevice<I2cDeviceSynch> {
         out.put(infoPkt);
 
         for (int i = 0; i < totalBlocks; i++) {
+            if (Thread.currentThread().isInterrupted() || !isPolling) {
+                break;
+            }
             // 💡【I2C Traffic Shaping / I2C 流量整形】:
             // Yield 2ms between blocks to allow high-frequency odometry readings (odo.update) to slip through instantly.
             // 在连续读取的间隙中，强制子线程让出 2ms。这极微小的空闲，刚好作为插队窗口，供主线程定位仪瞬间完成读取。
@@ -624,45 +640,72 @@ public class HuskyLensV2 extends I2cDeviceSynchDevice<I2cDeviceSynch> {
             return new Block[0];
         }
 
-        int totalBlocks = readU16(raw, CONTENT_INDEX + 6);
+        int totalBlocks;
+        try {
+            totalBlocks = readU16(raw, CONTENT_INDEX + 6);
+        } catch (IndexOutOfBoundsException e) {
+            return new Block[0];
+        }
         if (totalBlocks <= 0) {
             return new Block[0];
         }
 
         Block[] blocks = new Block[totalBlocks];
+        int parsedCount = 0;
         int ptr = 16;
 
-        for (int i = 0; i < totalBlocks; i++) {
-            if (ptr + 5 > raw.length) break;
+        try {
+            for (int i = 0; i < totalBlocks; i++) {
+                if (ptr + 5 > raw.length) break;
 
-            if (raw[ptr] != (byte) 0x55 || raw[ptr + 1] != (byte) 0xAA) break;
-            if (raw[ptr + 2] != (byte) 0x1C) break;
-
-            int contentSize = raw[ptr + 4] & 0xFF;
-            int packetSize = 5 + contentSize + 1;
-            if (ptr + packetSize > raw.length) break;
-
-            int id = raw[ptr + 5] & 0xFF;
-            int x = readU16(raw, ptr + 7);
-            int y = readU16(raw, ptr + 9);
-            int width = readU16(raw, ptr + 11);
-            int height = readU16(raw, ptr + 13);
-
-            int nameLen = raw[ptr + 15] & 0xFF;
-            String name = "";
-            if (nameLen > 0 && ptr + 16 + nameLen <= raw.length) {
-                try {
-                    name = new String(raw, ptr + 16, nameLen, "UTF-8");
-                } catch (Exception e) {
-                    name = "";
+                if (raw[ptr] != (byte) 0x55 || raw[ptr + 1] != (byte) 0xAA || raw[ptr + 2] != (byte) 0x1C) {
+                    break;
                 }
-            }
 
-            blocks[i] = new Block(id, x, y, width, height, name);
-            ptr += packetSize;
+                int contentSize = raw[ptr + 4] & 0xFF;
+
+                if (contentSize < 12) {
+                    break;
+                }
+
+                int packetSize = 5 + contentSize + 1;
+
+                if (ptr + packetSize > raw.length) {
+                    break;
+                }
+
+                int id = raw[ptr + 5] & 0xFF;
+                int x = readU16(raw, ptr + 7);
+                int y = readU16(raw, ptr + 9);
+                int width = readU16(raw, ptr + 11);
+                int height = raw[ptr + 13];
+
+                int nameLen = raw[ptr + 15] & 0xFF;
+                String name = "";
+
+                if (nameLen > 0) {
+                    if (ptr + 16 + nameLen <= ptr + packetSize - 1) {
+                        name = new String(raw, ptr + 16, nameLen, "UTF-8");
+                    } else {
+                        break;
+                    }
+                }
+
+                blocks[parsedCount] = new Block(id, x, y, width, height, name);
+                parsedCount++;
+
+                ptr += packetSize;
+            }
+        } catch (IndexOutOfBoundsException | java.io.UnsupportedEncodingException e) {
         }
 
-        return blocks;
+        if (parsedCount == totalBlocks) {
+            return blocks;
+        } else {
+            Block[] trimmedBlocks = new Block[parsedCount];
+            System.arraycopy(blocks, 0, trimmedBlocks, 0, parsedCount);
+            return trimmedBlocks;
+        }
     }
 
     /**
